@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import pandas as pd
 import asyncio
 import logging
@@ -148,17 +148,115 @@ class TradingBot:
         position_size = self.max_position_size * confidence_factor * risk_reward_factor
         return round(position_size, 2)
         
-    async def get_trading_decision(self, timestamp=None):
-        """Get trading decision for the current market state.
+    def _adjust_position_for_regime(self, position: float, confidence: float, regime_info: Dict) -> float:
+        """Adjust position size based on market regime."""
+        regime = regime_info['regime']
+        regime_conf = regime_info['confidence']
         
-        Args:
-            timestamp: Optional timestamp to get decision for (used in backtesting)
+        # Base position scaling factors for different regimes
+        regime_factors = {
+            MarketRegime.TRENDING_UP: 1.0,
+            MarketRegime.TRENDING_DOWN: 1.0,
+            MarketRegime.MOMENTUM: 1.2,  # Increase size in strong momentum
+            MarketRegime.BREAKOUT: 1.1,  # Slightly increase for breakouts
+            MarketRegime.RANGING_LOW_VOL: 0.8,  # Reduce size in ranging markets
+            MarketRegime.RANGING_HIGH_VOL: 0.6,  # Further reduce in high volatility
+            MarketRegime.REVERSAL: 0.7,  # Conservative on reversals
+            MarketRegime.ACCUMULATION: 0.9,  # Moderate in accumulation
+            MarketRegime.DISTRIBUTION: 0.7,  # Conservative in distribution
+            MarketRegime.EXHAUSTION: 0.5,  # Very conservative in exhaustion
+        }
+        
+        # Get base regime factor
+        regime_factor = regime_factors.get(regime, 0.5)
+        
+        # Adjust factor based on regime confidence
+        regime_factor *= regime_conf
+        
+        # Calculate final position size
+        adjusted_position = position * regime_factor * confidence
+        
+        # Ensure position is within bounds
+        return max(min(adjusted_position, 1.0), -1.0)
+
+    def _adjust_stops_for_regime(self, take_profit: float, stop_loss: float, 
+                               current_price: float, regime_info: Dict) -> Tuple[float, float]:
+        """Adjust stop levels based on market regime."""
+        regime = regime_info['regime']
+        
+        # Base risk multipliers for different regimes
+        risk_multipliers = {
+            MarketRegime.TRENDING_UP: 1.0,
+            MarketRegime.TRENDING_DOWN: 1.0,
+            MarketRegime.MOMENTUM: 0.8,  # Tighter stops in momentum
+            MarketRegime.BREAKOUT: 1.2,  # Wider stops for breakouts
+            MarketRegime.RANGING_LOW_VOL: 0.9,
+            MarketRegime.RANGING_HIGH_VOL: 1.3,  # Wider stops in high vol
+            MarketRegime.REVERSAL: 1.1,
+            MarketRegime.ACCUMULATION: 0.9,
+            MarketRegime.DISTRIBUTION: 1.1,
+            MarketRegime.EXHAUSTION: 1.2,
+        }
+        
+        multiplier = risk_multipliers.get(regime, 1.0)
+        
+        # Calculate base distances
+        if take_profit is not None:
+            tp_distance = abs(take_profit - current_price)
+            adjusted_tp = current_price + (tp_distance * multiplier * (1 if take_profit > current_price else -1))
+        else:
+            adjusted_tp = take_profit
             
-        Returns:
-            dict: Trading decision with position, confidence, take-profit, stop-loss and reasoning
-        """
+        if stop_loss is not None:
+            sl_distance = abs(stop_loss - current_price)
+            adjusted_sl = current_price + (sl_distance * multiplier * (1 if stop_loss > current_price else -1))
+        else:
+            adjusted_sl = stop_loss
+            
+        return adjusted_tp, adjusted_sl
+
+    def _analyze_order_flow(self, df: pd.DataFrame) -> Dict:
+        """Analyze order flow patterns to detect institutional activity."""
+        # Calculate imbalances
+        df['body_size'] = abs(df['close'] - df['open'])
+        df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+        df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+        
+        # Detect sweeps (large aggressive orders)
+        vol_mean = df['volume'].rolling(20).mean()
+        df['sweep'] = (df['volume'] > vol_mean * 2) & (df['body_size'] > df['body_size'].rolling(20).mean())
+        
+        # Analyze recent sweeps
+        recent = df.tail(20)
+        bullish_sweeps = recent[
+            (recent['sweep']) & 
+            (recent['close'] > recent['open'])
+        ]['volume'].sum()
+        bearish_sweeps = recent[
+            (recent['sweep']) & 
+            (recent['close'] < recent['open'])
+        ]['volume'].sum()
+        
+        # Detect stopping volume
+        df['stopping_volume'] = (
+            (df['volume'] > vol_mean * 1.5) &
+            (
+                ((df['close'] > df['open']) & (df['lower_wick'] > df['body_size'])) |
+                ((df['close'] < df['open']) & (df['upper_wick'] > df['body_size']))
+            )
+        )
+        
+        return {
+            "sweep_bias": "bullish" if bullish_sweeps > bearish_sweeps else "bearish",
+            "sweep_strength": max(bullish_sweeps, bearish_sweeps) / vol_mean.mean(),
+            "stopping_volume_detected": recent['stopping_volume'].any(),
+            "aggressive_flow": (bullish_sweeps + bearish_sweeps) > (vol_mean.mean() * 10)
+        }
+
+    async def get_trading_decision(self, timestamp=None):
+        """Get trading decision with enhanced order flow analysis."""
         try:
-            # Fetch multi-timeframe data
+            # Fetch data
             hourly_df, min15_df, min5_df, min1_df = await self.data_fetcher.fetch_multi_timeframe_data(end_time=timestamp)
             
             if min1_df.empty:
@@ -170,38 +268,71 @@ class TradingBot:
                 
             current_price = min1_df.iloc[-1]['close']
             
+            # Analyze order flow
+            flow_analysis = self._analyze_order_flow(min1_df)
+            
             # Detect market regime
             regime_info = self.regime_detector.detect_regime(hourly_df, min15_df)
             
-            # Get trading decision from LLM
+            # Get base trading decision
             decision = await self.llm.get_trading_decision(
                 hourly_df=hourly_df,
                 min15_df=min15_df,
                 min5_df=min5_df,
                 min1_df=min1_df,
-                additional_context={"market_regime": regime_info}
+                additional_context={
+                    "market_regime": regime_info,
+                    "order_flow": flow_analysis
+                }
             )
             
-            # Add current price for position sizing
+            # Add current price
             decision['current_price'] = current_price
             
-            # Adjust decision based on market regime
+            # Adjust based on order flow
+            if flow_analysis['aggressive_flow']:
+                if flow_analysis['sweep_bias'] == "bullish" and decision['position'] > 0:
+                    decision['confidence'] = min(1.0, decision['confidence'] * (1 + flow_analysis['sweep_strength']))
+                elif flow_analysis['sweep_bias'] == "bearish" and decision['position'] < 0:
+                    decision['confidence'] = min(1.0, decision['confidence'] * (1 + flow_analysis['sweep_strength']))
+                    
+            if flow_analysis['stopping_volume_detected']:
+                decision['confidence'] *= 0.7  # Reduce confidence when stopping volume is detected
+            
+            # Adjust for regime
             decision = self._adjust_for_regime(decision, regime_info)
             
-            # Calculate position size
+            # Calculate final position size
             raw_position = decision.get('position', 0)
-            position_size = self._calculate_position_size(decision)
+            adjusted_position = self._adjust_position_for_regime(
+                raw_position, 
+                decision['confidence'],
+                regime_info
+            )
             
-            # Scale the position by calculated size
-            decision['position'] = position_size if raw_position > 0 else -position_size
+            # Adjust stops
+            adjusted_tp, adjusted_sl = self._adjust_stops_for_regime(
+                decision['take_profit'],
+                decision['stop_loss'],
+                current_price,
+                regime_info
+            )
             
-            # Log decision details
+            # Update decision
+            decision.update({
+                'position': adjusted_position,
+                'take_profit': adjusted_tp,
+                'stop_loss': adjusted_sl
+            })
+            
+            # Log enhanced decision details
             self.logger.info(
                 f"Decision: pos={decision['position']:.2f} (raw={raw_position:.2f}), "
                 f"conf={decision.get('confidence', 0):.2f}, "
                 f"tp={decision.get('take_profit', 0):.2f}, "
                 f"sl={decision.get('stop_loss', 0):.2f}, "
-                f"regime={regime_info['regime'].value}"
+                f"regime={regime_info['regime'].value}, "
+                f"flow_bias={flow_analysis['sweep_bias']}"
             )
             
             return decision

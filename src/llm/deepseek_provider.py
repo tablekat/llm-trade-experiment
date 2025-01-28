@@ -34,13 +34,46 @@ class DeepSeekProvider(LLMProvider):
 
     def _generate_prompt(self, hourly_df: pd.DataFrame, min15_df: pd.DataFrame, min5_df: pd.DataFrame, min1_df: pd.DataFrame, additional_context: dict = None) -> str:
         """Generate analysis prompt from market data."""
-        # Get summary stats for each timeframe
+        # Get key price levels
+        def get_key_levels(df: pd.DataFrame, periods: int = 20) -> tuple:
+            highs = df['high'].rolling(periods, center=True).max()
+            lows = df['low'].rolling(periods, center=True).min()
+            current_price = df['close'].iloc[-1]
+            
+            resistance_levels = sorted([p for p in highs.unique() if p > current_price])[:3]
+            support_levels = sorted([p for p in lows.unique() if p < current_price], reverse=True)[:3]
+            return support_levels, resistance_levels
+
+        # Calculate technical indicators
+        def calculate_indicators(df: pd.DataFrame) -> dict:
+            # EMAs
+            df['ema20'] = df['close'].ewm(span=20).mean()
+            df['ema50'] = df['close'].ewm(span=50).mean()
+            
+            # RSI
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            # Volume analysis
+            vol_sma = df['volume'].rolling(20).mean()
+            rel_vol = df['volume'] / vol_sma
+            
+            return {
+                'ema_trend': 'Bullish' if df['ema20'].iloc[-1] > df['ema50'].iloc[-1] else 'Bearish',
+                'rsi': rsi.iloc[-1],
+                'rel_volume': rel_vol.iloc[-1]
+            }
+
+        # Generate timeframe analysis
         summaries = []
-        for name, df in [
-            ("hourly", hourly_df),
-            ("15-minute", min15_df),
-            ("5-minute", min5_df),
-            ("1-minute", min1_df)
+        for name, df, weight in [
+            ("Hourly", hourly_df, "40%"),
+            ("15-minute", min15_df, "30%"),
+            ("5-minute", min5_df, "20%"),
+            ("1-minute", min1_df, "10%")
         ]:
             if df.empty:
                 continue
@@ -48,30 +81,57 @@ class DeepSeekProvider(LLMProvider):
             current = df.iloc[-1]
             recent = df.tail(10)
             
-            price_change = ((current['close'] - recent.iloc[0]['close']) / recent.iloc[0]['close']) * 100
-            volatility = recent['close'].std()
-            volume_trend = "Increasing" if recent['volume'].is_monotonic_increasing else "Decreasing"
+            # Get key levels
+            supports, resistances = get_key_levels(df)
+            indicators = calculate_indicators(df)
             
-            summary = f"{name.capitalize()} candles:\n"
-            summary += f"Current: Open={current['open']:.2f}, High={current['high']:.2f}, Low={current['low']:.2f}, Close={current['close']:.2f}\n"
-            summary += "Recent trends:\n"
-            summary += f"- Price change last 10 periods: {price_change:.2f}%\n"
-            summary += f"- Volatility (10-period std): {volatility:.2f}\n"
-            summary += f"- Volume trend: {volume_trend}\n"
+            price_change = ((current['close'] - recent.iloc[0]['close']) / recent.iloc[0]['close']) * 100
+            vol_change = ((current['volume'] - recent['volume'].mean()) / recent['volume'].mean()) * 100
+            
+            summary = f"\n{name} Analysis (Weight: {weight}):\n"
+            summary += f"Price Action:\n"
+            summary += f"- Current: {current['close']:.2f} ({price_change:+.2f}% last 10 periods)\n"
+            summary += f"- Key Resistances: {', '.join(f'{r:.2f}' for r in resistances)}\n"
+            summary += f"- Key Supports: {', '.join(f'{s:.2f}' for s in supports)}\n"
+            summary += f"\nTechnical Indicators:\n"
+            summary += f"- Trend: {indicators['ema_trend']} (EMA20 vs EMA50)\n"
+            summary += f"- RSI: {indicators['rsi']:.1f}\n"
+            summary += f"- Volume: {vol_change:+.2f}% vs average (Relative: {indicators['rel_volume']:.2f}x)\n"
             summaries.append(summary)
             
-        prompt = "You are a professional futures trader. Analyze the following market data and provide a trading decision.\n\n"
-        prompt += "Market Data:\n"
-        prompt += "\n".join(f"{i+1}. Last 100 {summary}" for i, summary in enumerate(summaries))
+        prompt = """You are an expert futures trader specializing in market structure analysis and risk management.
+Analyze the following market data and provide a detailed trading decision.
+
+Key Requirements:
+1. Position size must reflect both directional conviction AND current market regime
+2. Stop-loss must be placed beyond the nearest significant structure (support/resistance, fair value gap)
+3. Take-profit must target the next major structure level with good risk:reward (minimum 1:1.5)
+4. Confidence should consider:
+   - Alignment of trends across timeframes
+   - Volume confirmation
+   - Market structure (support/resistance, fair value gaps)
+   - Current market regime and volatility
+
+Market Analysis:
+"""
+        prompt += "\n".join(summaries)
         
         if additional_context:
-            prompt += f"\nAdditional Context:\n{additional_context}\n"
+            prompt += f"\nMarket Context:\n{additional_context}\n"
             
-        prompt += "\nBased on this data, should we go long or short? Provide:\n"
-        prompt += "1. Position (-1.0 for full short to 1.0 for full long)\n"
-        prompt += "2. Confidence level (0.0 to 1.0)\n"
-        prompt += "3. Brief explanation of your reasoning\n\n"
-        prompt += "Format your response as a JSON object with keys: position, confidence, reasoning"
+        prompt += """\nBased on this analysis, provide a trading decision with:
+1. Position (-1.0 for full short to 1.0 for full long)
+2. Confidence level (0.0 to 1.0)
+3. Take-profit price (must be at significant structure level)
+4. Stop-loss price (must be beyond nearest structure)
+5. Detailed reasoning including:
+   - Primary market structure levels being used
+   - Multi-timeframe trend alignment
+   - Volume confirmation/concerns
+   - Risk:reward ratio justification
+
+Format response as JSON with keys: position, confidence, take_profit, stop_loss, reasoning
+Note: reasoning should be a dictionary with keys: primary_levels, multi_timeframe_alignment, volume_confirmation, risk_reward"""
         
         return prompt
 

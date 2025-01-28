@@ -175,39 +175,47 @@ class MarketRegimeDetector:
         return mom_strength, mom_direction
         
     def _analyze_volume_profile(self, df: pd.DataFrame) -> Dict:
-        """Analyze volume profile for accumulation/distribution patterns.
+        """Analyze volume profile for institutional activity patterns."""
+        # Calculate base metrics
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['money_flow'] = df['typical_price'] * df['volume']
         
-        Returns:
-            Dict with volume analysis metrics
-        """
-        # Calculate volume metrics
-        vol_sma = df['volume'].rolling(20).mean()
+        # Detect large volume clusters
+        vol_mean = df['volume'].rolling(20).mean()
         vol_std = df['volume'].rolling(20).std()
-        rel_vol = df['volume'] / vol_sma
+        df['large_volume'] = df['volume'] > (vol_mean + 2 * vol_std)
         
-        # Detect volume trends
-        vol_trend = df['volume'].rolling(10).mean().diff()
-        vol_trend_strength = abs(vol_trend.mean() / vol_std.mean())
+        # Analyze price action around large volume
+        large_vol_bars = df[df['large_volume']]
+        bullish_volume = large_vol_bars[large_vol_bars['close'] > large_vol_bars['open']]['volume'].sum()
+        bearish_volume = large_vol_bars[large_vol_bars['close'] < large_vol_bars['open']]['volume'].sum()
         
-        # Price spread analysis
-        spreads = df['high'] - df['low']
-        spread_ma = spreads.rolling(20).mean()
+        # Delta volume analysis
+        df['delta'] = np.where(df['close'] > df['open'], df['volume'], -df['volume'])
+        cumulative_delta = df['delta'].rolling(20).sum()
         
-        # Volume by price analysis (simple version)
-        price_bins = pd.qcut(df['close'], q=5, labels=['bottom', 'low', 'mid', 'high', 'top'])
-        vol_by_price = df.groupby(price_bins)['volume'].mean()
+        # Detect absorption
+        df['spread'] = df['high'] - df['low']
+        df['absorption'] = (df['volume'] > vol_mean * 1.5) & (df['spread'] < df['spread'].rolling(20).mean() * 0.7)
         
-        # Detect accumulation/distribution
-        high_vol_at_lows = (vol_by_price['bottom'] + vol_by_price['low']) / vol_by_price.mean()
-        high_vol_at_highs = (vol_by_price['top'] + vol_by_price['high']) / vol_by_price.mean()
+        # Price rejection analysis
+        df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+        df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+        df['body'] = abs(df['close'] - df['open'])
+        
+        recent = df.tail(20)
         
         return {
-            "vol_trend_strength": vol_trend_strength,
-            "vol_trend_direction": np.sign(vol_trend.iloc[-1]),
-            "relative_volume": rel_vol.iloc[-1],
-            "spread_ratio": spreads.iloc[-1] / spread_ma.iloc[-1],
-            "high_vol_at_lows": high_vol_at_lows,
-            "high_vol_at_highs": high_vol_at_highs
+            "vol_trend_strength": abs(cumulative_delta.iloc[-1] / df['volume'].mean()),
+            "vol_trend_direction": np.sign(cumulative_delta.iloc[-1]),
+            "institutional_bias": "bullish" if bullish_volume > bearish_volume else "bearish",
+            "absorption_detected": recent['absorption'].any(),
+            "price_rejection": {
+                "up": (recent['upper_wick'] > recent['body'] * 2).any(),
+                "down": (recent['lower_wick'] > recent['body'] * 2).any()
+            },
+            "relative_volume": df['volume'].iloc[-1] / vol_mean.iloc[-1],
+            "large_player_activity": (df['large_volume'].rolling(5).sum().iloc[-1] > 2)
         }
         
     def _detect_liquidity_levels(self, df: pd.DataFrame) -> Dict:
